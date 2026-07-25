@@ -74,9 +74,6 @@ def get_target_user(message: types.Message):
 # -------------------------------------------------------------------
 # Команды модерации & Кастомные команды
 # -------------------------------------------------------------------
-@dp.message(Command("bot"))
-async def cmd_bot(message: types.Message):
-    await message.answer("🤖 Бот-модератор работает 24/7 в облаке!")
 
 
 @dp.message(Command("ban"))
