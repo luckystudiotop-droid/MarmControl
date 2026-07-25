@@ -309,7 +309,7 @@ async def process_captcha(call: types.CallbackQuery):
 
     # ОТПРАВЛЯЕМ ПРИВЕТСТВИЕ С КНОПКОЙ
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Наш сайт", url="https://t.me/marmelad_channel")]
+        [InlineKeyboardButton(text="🔗 Наш сайт", url="https://marmelad.cc/shop/")]
         # <-- ЗАМЕНИТЬ ССЫЛКУ ТУТ
     ])
 
