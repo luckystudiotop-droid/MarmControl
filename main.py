@@ -1,27 +1,31 @@
 import asyncio
 import logging
 import os
+import time
 import asyncpg
 from aiohttp import web
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command, CommandObject
-from aiogram.types import ChatPermissions
+from aiogram.types import ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton
 
 # -------------------------------------------------------------------
 # 1. Настройки и Переменные
 # -------------------------------------------------------------------
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-# Render автоматически передает PORT (по умолчанию 10000 или 8080)
 PORT = int(os.getenv("PORT", 8080))
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 db_pool = None
 
+# Словари для анти-спама и капчи
+spam_tracker = {}
+captcha_tasks = {}
+
 
 # -------------------------------------------------------------------
-# 2. Веб-сервер для "Health Check" (Чтобы Render не убивал бота)
+# 2. Веб-сервер (Health Check для Render)
 # -------------------------------------------------------------------
 async def handle_ping(request):
     return web.Response(text="MarmControl Bot is ALIVE!", status=200)
@@ -72,11 +76,55 @@ def get_target_user(message: types.Message):
 
 
 # -------------------------------------------------------------------
-# 5. Системные команды модерации
+# 5. Middleware (Анти-спам фильтр)
 # -------------------------------------------------------------------
+class AntiSpamMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: types.Message, data: dict):
+        # Проверяем только текстовые и медиа сообщения
+        if not event.text and not event.photo and not event.video:
+            return await handler(event, data)
+
+        user_id = event.from_user.id
+        chat_id = event.chat.id
+        msg_id = event.message_id
+        now = time.time()
+
+        if user_id not in spam_tracker:
+            spam_tracker[user_id] = []
+
+        # Оставляем в памяти только сообщения за последнюю 1 секунду
+        spam_tracker[user_id] = [(t, m) for t, m in spam_tracker[user_id] if now - t <= 1.0]
+        spam_tracker[user_id].append((now, msg_id))
+
+        # Если больше 5 сообщений за секунду - НАКАЗАНИЕ
+        if len(spam_tracker[user_id]) > 5:
+            if not await is_admin(chat_id, user_id):
+                # Мут на 3 дня
+                until_date = int(now) + 3 * 24 * 3600
+                perms = ChatPermissions(can_send_messages=False)
+                try:
+                    await bot.restrict_chat_member(chat_id, user_id, permissions=perms, until_date=until_date)
+
+                    # Удаляем спам-сообщения
+                    for _, m_id in spam_tracker[user_id]:
+                        try:
+                            await bot.delete_message(chat_id, m_id)
+                        except:
+                            pass
+
+                    spam_tracker[user_id].clear()
+                    await bot.send_message(chat_id,
+                                           f"🛑 Пользователь {event.from_user.full_name} заглушен на 3 дня за флуд/спам.")
+                except Exception as e:
+                    logging.error(f"AntiSpam Error: {e}")
+                return  # Прерываем обработку спама
+
+        return await handler(event, data)
 
 
-
+# -------------------------------------------------------------------
+# 6. Системные команды модерации
+# -------------------------------------------------------------------
 @dp.message(Command("ban"))
 async def cmd_ban(message: types.Message):
     if not await is_admin(message.chat.id, message.from_user.id):
@@ -135,7 +183,7 @@ async def cmd_unmute(message: types.Message):
 
 
 # -------------------------------------------------------------------
-# 6. Управление базой данных
+# 7. Управление базой данных (Кастомные команды)
 # -------------------------------------------------------------------
 @dp.message(Command("personal"))
 async def cmd_personal(message: types.Message, command: CommandObject):
@@ -155,7 +203,7 @@ async def cmd_personal(message: types.Message, command: CommandObject):
         await message.answer(f"✅ Команда `/{cmd_name}` сохранена!", parse_mode="Markdown")
     except Exception as e:
         logging.error(f"DB Error (personal): {e}")
-        await message.answer("⚠️ Ошибка сохранения в базу данных.")
+        await message.answer("⚠️ Ошибка сохранения в БД.")
 
 
 @dp.message(Command("remove"))
@@ -176,19 +224,113 @@ async def cmd_remove(message: types.Message, command: CommandObject):
                 await message.answer(f"⚠️ Команда `/{cmd_name}` не найдена.", parse_mode="Markdown")
     except Exception as e:
         logging.error(f"DB Error (remove): {e}")
-        await message.answer("⚠️ Ошибка удаления из базы данных.")
 
 
 # -------------------------------------------------------------------
-# 7. Обработка КАСТОМНЫХ команд (САМАЯ ПОСЛЕДНЯЯ ФУНКЦИЯ!)
+# 8. Защита от ботов (Капча) и Приветствие
+# -------------------------------------------------------------------
+async def kick_if_not_passed(chat_id, user_id, captcha_msg_id):
+    await asyncio.sleep(120)  # Ждем 2 минуты
+    try:
+        # Если задача не отменена (юзер не нажал кнопку) - кикаем
+        await bot.ban_chat_member(chat_id, user_id)
+        await bot.unban_chat_member(chat_id, user_id)
+        await bot.delete_message(chat_id, captcha_msg_id)
+    except:
+        pass
+
+
+async def delete_msg_later(chat_id, msg_id, delay):
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id, msg_id)
+    except:
+        pass
+
+
+@dp.message(F.new_chat_members)
+async def on_user_join(message: types.Message):
+    # 1. Удаляем системное сообщение о входе
+    try:
+        await message.delete()
+    except:
+        pass
+
+    for new_user in message.new_chat_members:
+        # Если добавили бота - игнорим логику капчи (или кикаем, если надо будет)
+        if new_user.is_bot:
+            continue
+
+        # 2. Бросаем в мут
+        perms = ChatPermissions(can_send_messages=False)
+        try:
+            await bot.restrict_chat_member(message.chat.id, new_user.id, permissions=perms)
+        except:
+            continue  # Если у бота нет прав
+
+        # 3. Отправляем капчу
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 Я не робот", callback_data=f"captcha_{new_user.id}")]
+        ])
+
+        captcha_msg = await message.answer(
+            f"Привет, {new_user.full_name}! 👋\nНажми кнопку ниже в течение 2 минут, чтобы доказать, что ты не бот.",
+            reply_markup=kb
+        )
+
+        # 4. Запускаем таймер на кик
+        task = asyncio.create_task(kick_if_not_passed(message.chat.id, new_user.id, captcha_msg.message_id))
+        captcha_tasks[f"{message.chat.id}_{new_user.id}"] = task
+
+
+@dp.callback_query(F.data.startswith("captcha_"))
+async def process_captcha(call: types.CallbackQuery):
+    target_user_id = int(call.data.split("_")[1])
+
+    # Защита: только тот юзер может нажать кнопку
+    if call.from_user.id != target_user_id:
+        return await call.answer("Это не твоя кнопка! 👀", show_alert=True)
+
+    # Отменяем кик
+    task_key = f"{call.message.chat.id}_{target_user_id}"
+    if task_key in captcha_tasks:
+        captcha_tasks[task_key].cancel()
+        del captcha_tasks[task_key]
+
+    # Снимаем мут
+    perms = ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True)
+    await bot.restrict_chat_member(call.message.chat.id, target_user_id, permissions=perms)
+
+    # Удаляем сообщение с капчей
+    try:
+        await call.message.delete()
+    except:
+        pass
+
+    # ОТПРАВЛЯЕМ ПРИВЕТСТВИЕ С КНОПКОЙ
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Наш сайт", url="https://t.me/marmelad_channel")]
+        # <-- ЗАМЕНИТЬ ССЫЛКУ ТУТ
+    ])
+
+    welcome_msg = await bot.send_message(
+        call.message.chat.id,
+        f"🎉 {call.from_user.full_name}, добро пожаловать к нам!\nРады тебя видеть. Жми на кнопку ниже 👇",
+        reply_markup=kb
+    )
+
+    # Удаляем приветствие через 2 минуты (120 секунд)
+    asyncio.create_task(delete_msg_later(call.message.chat.id, welcome_msg.message_id, 120))
+
+
+# -------------------------------------------------------------------
+# 9. Обработка КАСТОМНЫХ команд
 # -------------------------------------------------------------------
 @dp.message(F.text.startswith('/'))
 async def process_custom_command(message: types.Message):
-    # Достаем имя команды без / и юзернейма
     raw_cmd = message.text.split()[0].lstrip('/')
     cmd_name = raw_cmd.split('@')[0].lower()
 
-    # Игнорируем стандартные команды, чтобы не было конфликтов
     built_in = {"ban", "unban", "mute", "unmute", "personal", "remove", "start", "help"}
     if cmd_name in built_in or not cmd_name:
         return
@@ -202,36 +344,27 @@ async def process_custom_command(message: types.Message):
 
             if row:
                 try:
-                    await bot.copy_message(
-                        chat_id=message.chat.id,
-                        from_chat_id=message.chat.id,
-                        message_id=row['message_id']
-                    )
+                    await bot.copy_message(chat_id=message.chat.id, from_chat_id=message.chat.id,
+                                           message_id=row['message_id'])
                 except Exception as e:
                     logging.error(f"Copy message error: {e}")
-                    await message.answer(
-                        f"⚠️ Сообщение для команды `/{cmd_name}` удалено. Создайте его заново через /personal.",
-                        parse_mode="Markdown")
     except Exception as e:
         logging.error(f"DB Error (custom cmd): {e}")
 
 
 # -------------------------------------------------------------------
-# 8. Запуск приложения
+# 10. Запуск
 # -------------------------------------------------------------------
 async def main():
     logging.basicConfig(level=logging.INFO)
 
-    # Запускаем микро-сервер, чтобы Render дал зеленый свет
-    asyncio.create_task(run_health_check_server())
+    # Регистрируем Анти-спам (Middleware)
+    dp.message.middleware(AntiSpamMiddleware())
 
-    # Подключаем Neon
+    asyncio.create_task(run_health_check_server())
     await init_db()
 
-    # Запускаем бота
-    logging.info("🚀 Бот запущен и слушает Telegram...")
-
-    # Эта строчка удалит старые ошибки из Telegram, чтобы бот запустился «чистым»
+    logging.info("🚀 Бот запущен!")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
