@@ -189,7 +189,7 @@ async def process_custom_command(message: types.Message):
     cmd_name = raw_cmd.split('@')[0].lower()
 
     # Игнорируем стандартные команды, чтобы не было конфликтов
-    built_in = {"bot", "ban", "unban", "mute", "unmute", "personal", "remove", "start", "help"}
+    built_in = {"ban", "unban", "mute", "unmute", "personal", "remove", "start", "help"}
     if cmd_name in built_in or not cmd_name:
         return
 
