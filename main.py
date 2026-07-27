@@ -250,25 +250,21 @@ async def delete_msg_later(chat_id, msg_id, delay):
 
 @dp.message(F.new_chat_members)
 async def on_user_join(message: types.Message):
-    # 1. Удаляем системное сообщение о входе
-    try:
-        await message.delete()
-    except:
-        pass
+    # УДАЛИЛИ строчку message.delete(), чтобы история чата у нового юзера не пропадала!
 
     for new_user in message.new_chat_members:
-        # Если добавили бота - игнорим логику капчи (или кикаем, если надо будет)
+        # Если добавили бота - пропускаем
         if new_user.is_bot:
             continue
 
-        # 2. Бросаем в мут
+        # 1. Бросаем в мут
         perms = ChatPermissions(can_send_messages=False)
         try:
             await bot.restrict_chat_member(message.chat.id, new_user.id, permissions=perms)
         except:
-            continue  # Если у бота нет прав
+            continue
 
-        # 3. Отправляем капчу
+        # 2. Отправляем капчу
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🤖 Я не робот", callback_data=f"captcha_{new_user.id}")]
         ])
@@ -278,7 +274,7 @@ async def on_user_join(message: types.Message):
             reply_markup=kb
         )
 
-        # 4. Запускаем таймер на кик
+        # 3. Запускаем таймер на кик
         task = asyncio.create_task(kick_if_not_passed(message.chat.id, new_user.id, captcha_msg.message_id))
         captcha_tasks[f"{message.chat.id}_{new_user.id}"] = task
 
@@ -320,7 +316,7 @@ async def process_captcha(call: types.CallbackQuery):
     )
 
     # Удаляем приветствие через 2 минуты (120 секунд)
-    asyncio.create_task(delete_msg_later(call.message.chat.id, welcome_msg.message_id, 120))
+
 
 
 # -------------------------------------------------------------------
