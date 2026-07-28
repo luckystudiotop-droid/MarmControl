@@ -50,6 +50,7 @@ async def init_db():
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL)
     async with db_pool.acquire() as conn:
+        # Таблица кастомных команд
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS commands (
                 chat_id BIGINT,
@@ -58,15 +59,38 @@ async def init_db():
                 PRIMARY KEY (chat_id, command_name)
             )
         """)
+        # Новая таблица настроек чата
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_settings (
+                chat_id BIGINT PRIMARY KEY,
+                captcha_enabled BOOLEAN DEFAULT TRUE,
+                welcome_enabled BOOLEAN DEFAULT TRUE,
+                antispam_enabled BOOLEAN DEFAULT TRUE,
+                del_system_msgs BOOLEAN DEFAULT FALSE
+            )
+        """)
     logging.info("🗄 База данных успешно подключена!")
+
+
+async def get_chat_settings(chat_id: int):
+    """Получает настройки чата. Если их нет - создает стандартные."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM chat_settings WHERE chat_id = $1", chat_id)
+        if not row:
+            await conn.execute("INSERT INTO chat_settings (chat_id) VALUES ($1) ON CONFLICT DO NOTHING", chat_id)
+            row = await conn.fetchrow("SELECT * FROM chat_settings WHERE chat_id = $1", chat_id)
+        return row
 
 
 # -------------------------------------------------------------------
 # 4. Вспомогательные функции
 # -------------------------------------------------------------------
 async def is_admin(chat_id: int, user_id: int) -> bool:
-    member = await bot.get_chat_member(chat_id, user_id)
-    return member.status in ("administrator", "creator")
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except:
+        return False
 
 
 def get_target_user(message: types.Message):
@@ -80,8 +104,15 @@ def get_target_user(message: types.Message):
 # -------------------------------------------------------------------
 class AntiSpamMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: types.Message, data: dict):
-        # Проверяем только текстовые и медиа сообщения
         if not event.text and not event.photo and not event.video:
+            return await handler(event, data)
+
+        if event.chat.type in ("private", "channel") or db_pool is None:
+            return await handler(event, data)
+
+        # Проверяем настройки чата (включен ли антиспам)
+        settings = await get_chat_settings(event.chat.id)
+        if not settings['antispam_enabled']:
             return await handler(event, data)
 
         user_id = event.from_user.id
@@ -104,7 +135,6 @@ class AntiSpamMiddleware(BaseMiddleware):
                 perms = ChatPermissions(can_send_messages=False)
                 try:
                     await bot.restrict_chat_member(chat_id, user_id, permissions=perms, until_date=until_date)
-
                     # Удаляем спам-сообщения
                     for _, m_id in spam_tracker[user_id]:
                         try:
@@ -123,7 +153,77 @@ class AntiSpamMiddleware(BaseMiddleware):
 
 
 # -------------------------------------------------------------------
-# 6. Системные команды модерации
+# 6. Настройки чата (Меню /settings)
+# -------------------------------------------------------------------
+def get_settings_keyboard(settings):
+    """Генерирует клавиатуру настроек на основе данных из БД."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🧠 Капча: {'✅' if settings['captcha_enabled'] else '❌'}",
+                              callback_data="set_captcha")],
+        [InlineKeyboardButton(text=f"💬 Приветствие: {'✅' if settings['welcome_enabled'] else '❌'}",
+                              callback_data="set_welcome")],
+        [InlineKeyboardButton(text=f"🛡 Анти-спам: {'✅' if settings['antispam_enabled'] else '❌'}",
+                              callback_data="set_antispam")],
+        [InlineKeyboardButton(text=f"🗑 Удалять входы/выходы: {'✅' if settings['del_system_msgs'] else '❌'}",
+                              callback_data="set_delsys")],
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="set_close")]
+    ])
+
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: types.Message):
+    if message.chat.type == "private":
+        return await message.answer("Эта команда работает только в группах.")
+    if not await is_admin(message.chat.id, message.from_user.id):
+        return await message.answer("❌ Нет прав.")
+
+    settings = await get_chat_settings(message.chat.id)
+    kb = get_settings_keyboard(settings)
+    await message.answer("⚙️ **Параметры группы:**\nВыберите функцию для переключения:", reply_markup=kb,
+                         parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("set_"))
+async def process_settings_callback(call: types.CallbackQuery):
+    if not await is_admin(call.message.chat.id, call.from_user.id):
+        return await call.answer("❌ Нет прав для изменения настроек.", show_alert=True)
+
+    action = call.data.split("_")[1]
+
+    if action == "close":
+        try:
+            await call.message.delete()
+        except:
+            pass
+        return await call.answer()
+
+    # Соответствие callback-данных и колонок в БД
+    col_map = {
+        "captcha": "captcha_enabled",
+        "welcome": "welcome_enabled",
+        "antispam": "antispam_enabled",
+        "delsys": "del_system_msgs"
+    }
+
+    col = col_map.get(action)
+    if col:
+        # Меняем значение на противоположное в БД
+        async with db_pool.acquire() as conn:
+            await conn.execute(f"UPDATE chat_settings SET {col} = NOT {col} WHERE chat_id = $1", call.message.chat.id)
+
+        # Обновляем клавиатуру
+        settings = await get_chat_settings(call.message.chat.id)
+        kb = get_settings_keyboard(settings)
+        try:
+            await call.message.edit_reply_markup(reply_markup=kb)
+        except:
+            pass
+
+    await call.answer("Настройка обновлена!")
+
+
+# -------------------------------------------------------------------
+# 7. Системные команды модерации
 # -------------------------------------------------------------------
 @dp.message(Command("ban"))
 async def cmd_ban(message: types.Message):
@@ -183,7 +283,7 @@ async def cmd_unmute(message: types.Message):
 
 
 # -------------------------------------------------------------------
-# 7. Управление базой данных (Кастомные команды)
+# 8. Управление базой данных (Кастомные команды)
 # -------------------------------------------------------------------
 @dp.message(Command("personal"))
 async def cmd_personal(message: types.Message, command: CommandObject):
@@ -227,12 +327,11 @@ async def cmd_remove(message: types.Message, command: CommandObject):
 
 
 # -------------------------------------------------------------------
-# 8. Защита от ботов (Капча) и Приветствие
+# 9. Защита от ботов (Капча) и Приветствие
 # -------------------------------------------------------------------
 async def kick_if_not_passed(chat_id, user_id, captcha_msg_id):
-    await asyncio.sleep(120)  # Ждем 2 минуты
+    await asyncio.sleep(120)
     try:
-        # Если задача не отменена (юзер не нажал кнопку) - кикаем
         await bot.ban_chat_member(chat_id, user_id)
         await bot.unban_chat_member(chat_id, user_id)
         await bot.delete_message(chat_id, captcha_msg_id)
@@ -240,54 +339,77 @@ async def kick_if_not_passed(chat_id, user_id, captcha_msg_id):
         pass
 
 
-async def delete_msg_later(chat_id, msg_id, delay):
-    await asyncio.sleep(delay)
-    try:
-        await bot.delete_message(chat_id, msg_id)
-    except:
-        pass
+async def send_welcome_message(chat_id, user):
+    """Функция для отправки приветствия (используется после капчи или напрямую)"""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Наш сайт", url="https://marmelad.cc/shop/")]
+    ])
+    await bot.send_message(
+        chat_id,
+        f"🎉 {user.full_name}, добро пожаловать к нам!\nРады тебя видеть. Жми на кнопку ниже 👇",
+        reply_markup=kb
+    )
+
+
+@dp.message(F.left_chat_member)
+async def on_user_leave(message: types.Message):
+    # Удаление сообщения о выходе (если включено в настройках)
+    settings = await get_chat_settings(message.chat.id)
+    if settings['del_system_msgs']:
+        try:
+            await message.delete()
+        except:
+            pass
 
 
 @dp.message(F.new_chat_members)
 async def on_user_join(message: types.Message):
-    # УДАЛИЛИ строчку message.delete(), чтобы история чата у нового юзера не пропадала!
+    settings = await get_chat_settings(message.chat.id)
+
+    # Удаление системного сообщения (если включено)
+    if settings['del_system_msgs']:
+        try:
+            await message.delete()
+        except:
+            pass
 
     for new_user in message.new_chat_members:
-        # Если добавили бота - пропускаем
         if new_user.is_bot:
             continue
 
-        # 1. Бросаем в мут
-        perms = ChatPermissions(can_send_messages=False)
-        try:
-            await bot.restrict_chat_member(message.chat.id, new_user.id, permissions=perms)
-        except:
-            continue
+        if settings['captcha_enabled']:
+            # Если капча ВКЛЮЧЕНА
+            perms = ChatPermissions(can_send_messages=False)
+            try:
+                await bot.restrict_chat_member(message.chat.id, new_user.id, permissions=perms)
+            except:
+                continue
 
-        # 2. Отправляем капчу
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🤖 Я не робот", callback_data=f"captcha_{new_user.id}")]
-        ])
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🤖 Я не робот", callback_data=f"captcha_{new_user.id}")]
+            ])
 
-        captcha_msg = await message.answer(
-            f"Привет, {new_user.full_name}! 👋\nНажми кнопку ниже в течение 2 минут, чтобы доказать, что ты не бот.",
-            reply_markup=kb
-        )
+            captcha_msg = await message.answer(
+                f"Привет, {new_user.full_name}! 👋\nНажми кнопку ниже в течение 2 минут, чтобы доказать, что ты не бот.",
+                reply_markup=kb
+            )
 
-        # 3. Запускаем таймер на кик
-        task = asyncio.create_task(kick_if_not_passed(message.chat.id, new_user.id, captcha_msg.message_id))
-        captcha_tasks[f"{message.chat.id}_{new_user.id}"] = task
+            task = asyncio.create_task(kick_if_not_passed(message.chat.id, new_user.id, captcha_msg.message_id))
+            captcha_tasks[f"{message.chat.id}_{new_user.id}"] = task
+        else:
+            # Если капча ВЫКЛЮЧЕНА, просто шлем приветствие (если оно включено)
+            if settings['welcome_enabled']:
+                await send_welcome_message(message.chat.id, new_user)
 
 
 @dp.callback_query(F.data.startswith("captcha_"))
 async def process_captcha(call: types.CallbackQuery):
     target_user_id = int(call.data.split("_")[1])
 
-    # Защита: только тот юзер может нажать кнопку
     if call.from_user.id != target_user_id:
         return await call.answer("Это не твоя кнопка! 👀", show_alert=True)
 
-    # Отменяем кик
+    # Отменяем таймер кика
     task_key = f"{call.message.chat.id}_{target_user_id}"
     if task_key in captcha_tasks:
         captcha_tasks[task_key].cancel()
@@ -297,37 +419,26 @@ async def process_captcha(call: types.CallbackQuery):
     perms = ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True)
     await bot.restrict_chat_member(call.message.chat.id, target_user_id, permissions=perms)
 
-    # Удаляем сообщение с капчей
     try:
         await call.message.delete()
     except:
         pass
 
-    # ОТПРАВЛЯЕМ ПРИВЕТСТВИЕ С КНОПКОЙ
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Наш сайт", url="https://marmelad.cc/shop/")]
-        # <-- ЗАМЕНИТЬ ССЫЛКУ ТУТ
-    ])
-
-    welcome_msg = await bot.send_message(
-        call.message.chat.id,
-        f"🎉 {call.from_user.full_name}, добро пожаловать к нам!\nРады тебя видеть. Жми на кнопку ниже 👇",
-        reply_markup=kb
-    )
-
-    # Удаляем приветствие через 2 минуты (120 секунд)
-
+    # Отправляем приветствие после капчи, если оно включено в настройках
+    settings = await get_chat_settings(call.message.chat.id)
+    if settings['welcome_enabled']:
+        await send_welcome_message(call.message.chat.id, call.from_user)
 
 
 # -------------------------------------------------------------------
-# 9. Обработка КАСТОМНЫХ команд
+# 10. Обработка КАСТОМНЫХ команд
 # -------------------------------------------------------------------
 @dp.message(F.text.startswith('/'))
 async def process_custom_command(message: types.Message):
     raw_cmd = message.text.split()[0].lstrip('/')
     cmd_name = raw_cmd.split('@')[0].lower()
 
-    built_in = {"ban", "unban", "mute", "unmute", "personal", "remove", "start", "help"}
+    built_in = {"ban", "unban", "mute", "unmute", "personal", "remove", "start", "help", "settings"}
     if cmd_name in built_in or not cmd_name:
         return
 
@@ -349,7 +460,7 @@ async def process_custom_command(message: types.Message):
 
 
 # -------------------------------------------------------------------
-# 10. Запуск
+# 11. Запуск
 # -------------------------------------------------------------------
 async def main():
     logging.basicConfig(level=logging.INFO)
