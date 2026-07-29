@@ -7,6 +7,8 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command, CommandObject
 from aiogram.types import ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram import Router
+from aiogram.types import Message
 
 # -------------------------------------------------------------------
 # 1. Настройки и Переменные
@@ -147,6 +149,13 @@ def get_settings_keyboard(settings):
         [InlineKeyboardButton(text=f"🗑 Удалять входы/выходы: {'✅' if settings['del_system_msgs'] else '❌'}", callback_data="set_delsys")],
         [InlineKeyboardButton(text="❌ Закрыть", callback_data="set_close")]
     ])
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer("Привет! Бот работает.")
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer("Вот список доступных команд:\n/start\n/help\n/settings\n/ban\n/unban\n/mute\n/unmute\n/personal\n/remove")
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: types.Message):
